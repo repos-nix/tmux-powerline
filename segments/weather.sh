@@ -1,125 +1,182 @@
-#!/bin/bash
 # Prints the current weather in Celsius, Fahrenheits or lord Kelvins. The forecast is cached and updated with a period of $update_period.
 
-# You location. Find a string that works for you by Googling on "weather in <location-string>"
-location="Lund, Sweden"
+# The update period in seconds.
+update_period=600
 
-# Can be any of {c,f,k}.
-unit="c"
+TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER_DEFAULT="yahoo"
+TMUX_POWERLINE_SEG_WEATHER_UNIT_DEFAULT="c"
+TMUX_POWERLINE_SEG_WEATHER_UPDATE_PERIOD_DEFAULT="600"
+if shell_is_bsd; then
+    TMUX_POWERLINE_SEG_WEATHER_GREP_DEFAULT="/usr/local/bin/grep"
+else
+    TMUX_POWERLINE_SEG_WEATHER_GREP_DEFAULT="grep"
+fi
 
-tmp_file="/tmp/tmux-powerline_weather.txt"
 
-get_condition_symbol() {
-	local conditions=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-	case "$conditions" in
-	sunny | "partly sunny" | "mostly sunny")
-		hour=$(date +%H)
-		if [ "$hour" -ge "22" -o "$hour" -le "5" ]; then
-			#echo "☽"
-			echo "☾"
-		else
-			#echo "☀"
-			echo "☼"
+generate_segmentrc() {
+	read -d '' rccontents  << EORC
+# The data provider to use. Currently only "yahoo" is supported.
+export TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER="${TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER_DEFAULT}"
+# What unit to use. Can be any of {c,f,k}.
+export TMUX_POWERLINE_SEG_WEATHER_UNIT="${TMUX_POWERLINE_SEG_WEATHER_UNIT_DEFAULT}"
+# How often to update the weather in seconds.
+export TMUX_POWERLINE_SEG_WEATHER_UPDATE_PERIOD="${TMUX_POWERLINE_SEG_WEATHER_UPDATE_PERIOD_DEFAULT}"
+# Name of GNU grep binary if in PATH, or path to it.
+export TMUX_POWERLINE_SEG_WEATHER_GREP="${TMUX_POWERLINE_SEG_WEATHER_GREP_DEFAULT}"
+
+# Your location. Find a code that works for you:
+# 1. Go to Yahoo weather http://weather.yahoo.com/
+# 2. Find the weather for you location
+# 3. Copy the last numbers in that URL. e.g. "http://weather.yahoo.com/united-states/california/newport-beach-12796587/" has the numbers "12796587"
+export TMUX_POWERLINE_SEG_WEATHER_LOCATION=""
+EORC
+	echo "$rccontents"
+}
+
+run_segment() {
+	__process_settings
+	local tmp_file="${TMUX_POWERLINE_DIR_TEMPORARY}/weather_yahoo.txt"
+	local weather
+	case "$TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER" in
+		"yahoo") weather=$(__yahoo_weather) ;;
+		*)
+			echo "Unknown weather provider [${$TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER}]";
+			return 1
+	esac
+	if [ -n "$weather" ]; then
+		echo "$weather"
+	fi
+}
+
+__process_settings() {
+	if [ -z "$TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER" ]; then
+		export TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER="${TMUX_POWERLINE_SEG_WEATHER_DATA_PROVIDER_DEFAULT}"
+	fi
+	if [ -z "$TMUX_POWERLINE_SEG_WEATHER_UNIT" ]; then
+		export TMUX_POWERLINE_SEG_WEATHER_UNIT="${TMUX_POWERLINE_SEG_WEATHER_UNIT_DEFAULT}"
+	fi
+	if [ -z "$TMUX_POWERLINE_SEG_WEATHER_UPDATE_PERIOD" ]; then
+		export TMUX_POWERLINE_SEG_WEATHER_UPDATE_PERIOD="${TMUX_POWERLINE_SEG_WEATHER_UPDATE_PERIOD_DEFAULT}"
+	fi
+	if [ -z "$TMUX_POWERLINE_SEG_WEATHER_GREP" ]; then
+		export TMUX_POWERLINE_SEG_WEATHER_GREP="${TMUX_POWERLINE_SEG_WEATHER_GREP_DEFAULT}"
+	fi
+	if [ -z "$TMUX_POWERLINE_SEG_WEATHER_LOCATION" ]; then
+		echo "No weather location specified.";
+		exit 8
+	fi
+}
+
+__yahoo_weather() {
+	degree=""
+	if [ -f "$tmp_file" ]; then
+		if shell_is_osx || shell_is_bsd; then
+			last_update=$(stat -f "%m" ${tmp_file})
+		elif shell_is_linux; then
+			last_update=$(stat -c "%Y" ${tmp_file})
 		fi
-		;;
-	"rain and snow" | "chance of rain" | "light rain" | rain | "heavy rain" | "freezing drizzle" | flurries | showers | "scattered showers" | drizzle | "rain showers")
-		#echo "☂"
-		echo "☔"
-		;;
-	snow | "light snow" | "scattered snow showers" | icy | ice/snow | "chance of snow" | "snow showers" | sleet)
-		#echo "☃"
-		echo "❅"
-		;;
-	"partly cloudy" | "mostly cloudy" | cloudy | overcast)
-		echo "☁"
-		;;
-	"chance of storm" | thunderstorm | "chance of tstorm" | storm | "scattered thunderstorms")
-		#echo "⚡"
-		echo "☈"
-		;;
-	dust | fog | smoke | haze | mist)
-		echo "♨"
-		;;
-	windy)
-		echo "⚑"
-		#echo "⚐"
-		;;
-	clear)
-		#echo "☐"
-		echo "✈"	# So clear you can see the aeroplanes! TODO what symbol does best represent a clear sky?
-		;;
-	*)
-		echo "？"
-		;;
+		time_now=$(date +%s)
+
+		up_to_date=$(echo "(${time_now}-${last_update}) < ${update_period}" | bc)
+		if [ "$up_to_date" -eq 1 ]; then
+			__read_tmp_file
+		fi
+	fi
+
+	if [ -z "$degree" ]; then
+		weather_data=$(curl --max-time 4 -s "http://weather.yahooapis.com/forecastrss?w=${TMUX_POWERLINE_SEG_WEATHER_LOCATION}&u=${TMUX_POWERLINE_SEG_WEATHER_UNIT}")
+		if [ "$?" -eq "0" ]; then
+			error=$(echo "$weather_data" | grep "problem_cause\|DOCTYPE");
+			if [ -n "$error" ]; then
+				echo "error"
+				exit 1
+			fi
+
+			# Assume latest grep is in PATH
+			gnugrep="${TMUX_POWERLINE_SEG_WEATHER_GREP}"
+
+			# <yweather:units temperature="F" distance="mi" pressure="in" speed="mph"/>
+			unit=$(echo "$weather_data" | "$gnugrep" -PZo "<yweather:units [^<>]*/>" | sed 's/.*temperature="\([^"]*\)".*/\1/')
+			condition=$(echo "$weather_data" | "$gnugrep" -PZo "<yweather:condition [^<>]*/>")
+			# <yweather:condition  text="Clear"  code="31"  temp="66"  date="Mon, 01 Oct 2012 8:00 pm CST" />
+			degree=$(echo "$condition" | sed 's/.*temp="\([^"]*\)".*/\1/')
+			condition=$(echo "$condition" | sed 's/.*text="\([^"]*\)".*/\1/')
+			# Pull the times for sunrise and sunset so we know when to change the day/night indicator
+			# <yweather:astronomy sunrise="6:56 am"   sunset="6:21 pm"/>
+			sunrise=$(date -d"$(echo "$weather_data" | "$gnugrep" "yweather:astronomy" | sed 's/^\(.*\)sunset.*/\1/' | sed 's/^.*sunrise="\(.*m\)".*/\1/')" +%H%M)
+			sunset=$(date -d"$(echo "$weather_data" | "$gnugrep" "yweather:astronomy" | sed 's/^.*sunset="\(.*m\)".*/\1/')" +%H%M)
+		elif [ -f "${tmp_file}" ]; then
+			__read_tmp_file
+		fi
+	fi
+
+	if [ -n "$degree" ]; then
+		if [ "$TMUX_POWERLINE_SEG_WEATHER_UNIT" == "k" ]; then
+			degree=$(echo "${degree} + 273.15" | bc)
+		fi
+		condition_symbol=$(__get_condition_symbol "$condition" "$sunrise" "$sunset") 
+		echo "${condition_symbol} ${degree}°$(echo "$TMUX_POWERLINE_SEG_WEATHER_UNIT" | tr '[:lower:]' '[:upper:]')" | tee "${tmp_file}"
+	fi
+}
+
+# Get symbol for condition. Available conditions: http://developer.yahoo.com/weather/#codes
+__get_condition_symbol() {
+	local condition=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local sunrise="$2"
+    local sunset="$3"
+	case "$condition" in
+		"sunny" | "hot")
+			hourmin=$(date +%H%M)
+			if [ "$hourmin" -ge "$sunset" -o "$hourmin" -le "$sunrise" ]; then
+				#echo "☽"
+				echo "☾"
+			else
+				#echo "☀"
+				echo "☼"
+			fi
+			;;
+		"rain" | "mixed rain and snow" | "mixed rain and sleet" | "freezing drizzle" | "drizzle" | "light drizzle" | "freezing rain" | "showers" | "mixed rain and hail" | "scattered showers" | "isolated thundershowers" | "thundershowers" | "light rain with thunder" | "light rain" | "rain and snow")
+			#echo "☂"
+			echo "☔"
+			;;
+		"snow" | "mixed snow and sleet" | "snow flurries" | "light snow showers" | "blowing snow" | "sleet" | "hail" | "heavy snow" | "scattered snow showers" | "snow showers" | "light snow" | "snow/windy" | "snow grains" | "snow/fog")
+			#echo "☃"
+			echo "❅"
+			;;
+		"cloudy" | "mostly cloudy" | "partly cloudy" | "partly cloudy/windy")
+			echo "☁"
+			;;
+		"tornado" | "tropical storm" | "hurricane" | "severe thunderstorms" | "thunderstorms" | "isolated thunderstorms" | "scattered thunderstorms")
+			#echo "⚡"
+			echo "☈"
+			;;
+		"dust" | "foggy" | "fog" | "haze" | "smoky" | "blustery" | "mist")
+			#echo "♨"
+			#echo "﹌"
+			echo "〰"
+			;;
+		"windy" | "fair/windy")
+			#echo "⚐"
+			echo "⚑"
+			;;
+		"clear" | "fair" | "cold")
+			hourmin=$(date +%H%M)
+			if [ "$hourmin" -ge "$sunset" -o "$hourmin" -le "$sunrise" ]; then
+				echo "☾"
+			else
+				echo "〇"
+			fi
+			;;
+		*)
+			echo "?"
+			;;
 	esac
 }
 
-read_tmp_file() {
+__read_tmp_file() {
 	if [ ! -f "$tmp_file" ]; then
 		return
 	fi
-	IFS_bak="$IFS"
-	IFS=$'\n'
-	lines=($(cat ${tmp_file}))
-	IFS="$IFS_bak"
-	degrees="${lines[0]}"
-	conditions="${lines[1]}"
+	cat "${tmp_file}"
+	exit
 }
-
-degrees=""
-if [ -f "$tmp_file" ]; then
-	if [ "$PLATFORM" == "mac" ]; then
-		last_update=$(stat -f "%m" ${tmp_file})
-	else
-		last_update=$(stat -c "%Y" ${tmp_file})
-	fi
-	time_now=$(date +%s)
-	update_period=600
-
-	up_to_date=$(echo "(${time_now}-${last_update}) < ${update_period}" | bc)
-	if [ "$up_to_date" -eq 1 ]; then
-		read_tmp_file
-	fi
-fi
-
-if [ -z "$degrees" ]; then
-	if [ "$unit" == "k" ]; then
-		search_unit="c"
-	else
-		search_unit="$unit"
-	fi
-	# Convert spaces before using this in the URL.
-	if [ "$PLATFORM" == "mac" ]; then
-		search_location=$(echo "$location" | sed -e 's/[ ]/%20/g')
-	else
-		search_location=$(echo "$location" | sed -e 's/\s/%20/g')
-	fi
-
-	weather_data=$(curl --max-time 4 -s "http://www.google.com/ig/api?weather=${search_location}")
-	if [ "$?" -eq "0" ]; then
-		error=$(echo "$weather_data" | grep "problem_cause\|DOCTYPE");
-		if [ -n "$error" ]; then
-			echo "error"
-			exit 1
-		fi
-		degrees=$(echo "$weather_data" | sed "s|.*<temp_${search_unit} data=\"\([^\"]*\)\"/>.*|\1|")
-		if [ "$PLATFORM" == "mac" ]; then
-			conditions=$(echo $weather_data | xpath //current_conditions/condition/@data 2> /dev/null | grep -oe '".*"' | sed "s/\"//g")
-		else
-			conditions=$(echo "$weather_data" | grep -PZo "<current_conditions>(\\n|.)*</current_conditions>" | grep -PZo "(?<=<condition\sdata=\")([^\"]*)")
-		fi
-		echo "$degrees" > $tmp_file
-		echo "$conditions" >> $tmp_file
-	elif [ -f "$tmp_file" ]; then
-		read_tmp_file
-	fi
-fi
-
-if [ -n "$degrees" ]; then
-	if [ "$unit" == "k" ]; then
-		degrees=$(echo "${degrees} + 273.15" | bc)
-	fi
-	unit_upper=$(echo "$unit" | tr '[cfk]' '[CFK]')
-	condition_symbol=$(get_condition_symbol "$conditions")
-	echo "${condition_symbol} ${degrees}°${unit_upper}"
-fi
